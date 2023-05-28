@@ -4,11 +4,15 @@
 #include <Wire.h>
 #include "config.h"
 
+#define CHECK_INTERVAL 100000
 #define DETECTOR_LENGTH 2
 #define IR_TRANSMITTER D8
-#define INTERVAL 100000
 #define MOTOR_CURRENT_STATE_LENGTH 2
 #define OUTPUT_SIZE 64
+#define PRESCALER (F_CPU / 1000000UL)
+#define PULSE_FREQUENCY 38000
+#define PULSE_INTERVAL 5000
+#define PULSE_LENGTH 1000
 
 const uint8_t detectorPins[DETECTOR_LENGTH] = {D9, D10};
 
@@ -22,9 +26,10 @@ EspMQTTClient client(
     AMQP_PORT);
 
 hw_timer_t *Timer0_Cfg = NULL;
-std::vector<unsigned long> irDetected = {0, 0};
-std::vector<unsigned long> irSent = {0, 0};
-unsigned long motorSent;
+unsigned long irDetected[] = {ULONG_MAX, ULONG_MAX};
+unsigned long irSent[] = {0, 0};
+unsigned long motorSent = 0;
+hw_timer_t *pulseTimer;
 SemaphoreHandle_t xMutex;
 
 void setup()
@@ -39,6 +44,12 @@ void setup()
     }
 
     xMutex = xSemaphoreCreateMutex();
+
+    pulseTimer = timerBegin(1, PRESCALER, true);
+    timerAttachInterrupt(pulseTimer, onStartPulse, true);
+    timerAlarmWrite(pulseTimer, PULSE_INTERVAL, true);
+    timerAlarmEnable(pulseTimer);
+    log_d("Setup complete");
 }
 
 void loop()
@@ -47,26 +58,17 @@ void loop()
     String output;
     size_t i;
     client.loop();
-    unsigned long start = micros() - INTERVAL;
-    if (*std::max_element(irDetected.begin(), irDetected.end()) < start)
-    {
-        // Start 38KHz output if neither input has gone low since the start of the interval
-        tone(IR_TRANSMITTER, 38000);
-    }
-
-    if (*std::min_element(irDetected.begin(), irDetected.end()) >= start)
-    {
-        // Stop 38KHz output if both inputs have gone low since the start of the interval
-        noTone(IR_TRANSMITTER);
-    }
+    unsigned long start = micros() - CHECK_INTERVAL;
 
     for (i = 0; i < DETECTOR_LENGTH; i++)
     {
         // Send event if pin has been high since start of the interval
         if (irDetected[i] < start && irSent[i] < start)
         {
+            log_d("IR beam on input: %d was last detected at: %d and a message sent at: %d", i, irDetected[i], irSent[i]);
             irSent[i] = micros();
             output = String(i);
+            log_d("Sending new message");
             client.publish(AMQP_DETECTOR_PUBLISH_TOPIC, output);
         }
     }
@@ -77,6 +79,7 @@ void loop()
         if (xSemaphoreTake(xMutex, portMAX_DELAY))
         {
             motorSent = micros();
+            log_d("Reading from %x", MOTOR_CONTROL_ADDRESS);
             Wire.requestFrom(MOTOR_CONTROL_ADDRESS, MOTOR_CURRENT_STATE_LENGTH);
             for (i = 0; i < MOTOR_CURRENT_STATE_LENGTH && Wire.available(); i++)
             {
@@ -95,6 +98,7 @@ void loop()
             xSemaphoreGive(xMutex);
 
             serializeJson(doc, output);
+            log_d("Writing '%s' to topic: %s", output.c_str(), AMQP_MOTOR_CONTROL_PUBLISH_TOPIC);
             client.publish(AMQP_MOTOR_CONTROL_PUBLISH_TOPIC, output);
         }
     }
@@ -111,13 +115,16 @@ std::function<void(const String &message)> onReceiveFactory(uint8_t address)
         JsonArray output = doc.as<JsonArray>();
         if (output.size() == 0)
         {
+            log_e("Invalid conetent in JSON");
             return;
         }
 
         while (!xSemaphoreTake(xMutex, portMAX_DELAY))
         {
+            log_d("Waiting for lock on mutex");
         }
 
+        log_d("Writing %d bytes state to: %x", output.size(), address);
         Wire.beginTransmission(address);
         for (i = 0; i < output.size(); i++)
         {
@@ -145,4 +152,9 @@ void onIrDetect()
             irDetected[i] = micros();
         }
     }
+}
+
+void onStartPulse()
+{
+    tone(IR_TRANSMITTER, PULSE_FREQUENCY, PULSE_LENGTH);
 }
