@@ -1,45 +1,44 @@
 # ESP32 TWI Relay
 
-The program is designed to run on a Seeed XIAO ESP32C3 to relay events published to an AMQP topic to a TWI bus to the [train-motor-controller](https://github.com/dnbeesley/train-motor-controller) and [train-points-controller](https://github.com/dnbeesley/train-points-controller) modules via a 3.3V to 5V level shifter.
-
-It also controls an IR beam breaker circuit, which publishes events to an AMQP topic when the beam is broken.
+The program is designed to run on a Seeed XIAO ESP32C3 to relay events published to an AMQP topic to a TWI bus as well as reads the state of devices on the bus and relays them back.
 
 This uses the [AduinoJson](https://arduinojson.org/) and [EspMQTTClient](https://github.com/plapointe6/EspMQTTClient) libraries.
 
 ## Configuration
 
-A header file, config.h, which is not committed to the repo, needs to define the following cstring constants:
+JSON file, written to the SPIFFS, needs to define the following:
 
-- AMQP_IP: The AMQP broker IP address
-- AMQP_DETECTOR_PUBLISH_TOPIC: The topic to which to publish events about beam breaking
-- AMQP_MOTOR_CONTROL_PUBLISH_TOPIC: The topic to which to publish events about the amount of current drawn from the motor controller.
-- AMQP_MOTOR_CONTROL_SUBSCRIBE_TOPIC: The topic to which to subscribe to receive events about changes to the motors state
-- AMQP_PASSWORD: The password used to log into the broker
-- AMQP_POINTS_CONTROL_SUBSCRIBE_TOPIC: The topic to which to subscribe to receive events about changes to the motors state
-- AMQP_USERNAME: The user name used to log into the broker
-- DEVICE_NAME: The device name to use when connecting to the AMQP broker
-- WIFI_PASSWORD: The WiFi password
-- WIFI_SSID: The WiFi SSID
-
-It also needs an integer constant defined:
-
-- AMQP_PORT: The port number to use
-- MOTOR_CONTROL_ADDRESS: The TWI address of the motor control module
-- POINTS_CONTROL_ADDRESS: The TWI address of the points control module
+```JSON
+{
+  "auth": {
+    "username": "username",
+    "password": "password"
+  },
+  "server": {
+    "ipAddress": "192.168.1.2",
+    "port": 5672
+  },
+  "readDevices": [
+    {
+      "address": 80, // Corresponding to device: 0x50
+      "length": 2
+    },
+    {
+      "address": 81, // Corresponding to device: 0x51
+      "length": 3
+    }
+  ],
+  "readInterval": 1, // seconds
+  "topicPrefix": "i2c-agent",
+  "wifi": {
+    "ssid": "Some-WIFI-SSID",
+    "password": "wifi-password"
+  }
+}
+```
 
 ## TWI Relay
 
-The device subscribes to the AMQP topics defined by AMQP_MOTOR_CONTROL_SUBSCRIBE_TOPIC and AMQP_POINTS_CONTROL_SUBSCRIBE_TOPIC. The contents of the messages should be JSON integer arrays. These are transmitted on the TWI bus to the addresses set by MOTOR_CONTROL_ADDRESS and POINTS_CONTROL_ADDRESS respectively.
+If the topicPrefix has been set to i2c-agent the micro-controller will subscribe to the topics with a pattern: i2c-agent/output/#. To write to a device with address 0x50 the topic: i2c-agent/output/50 should be published to with a JSON array of the bytes to write to the device.
 
-Roughly every 100ms the device reads two bytes from the motor control unit via the TWI bus and published an event to the AMQP topic named by AMQP_MOTOR_CONTROL_PUBLISH_TOPIC.
-
-## IR beam detection
-
-The IR detectors used detect pulses of 780nm infra-red modulated at 38KHz. Upon detection the output of the IR receive is set to low for a brief time. Through a set of interrupts the ESP32 records when a pulse was last recorded.
-
-The anode of a IR LED and ~ 100&#x03A9; resistor needs to be connected to D8. The output pins of the IR detectors need to be connected to D9 and D10.
-
-### Behaviour
-
-- Every 5ms, a 1ms second pulse of 38KHz is produced from the IR LED.
-- For each IR detector, if it has been more than 100ms since a signal was received and more than 100ms since an event was published to AMQP for that pin, a new event is published to indicate the beam is broken. However, if a signal has yet to be received at all an event won't be published.
+For the example config above the micro-controller with read 2 bytes from 0x50 and 3 bytes from 0x51 and publish the byte arrays as JSON array of numbers to the topics: i2c-agent/input/50 and i2c-agent/input/51 respectively.

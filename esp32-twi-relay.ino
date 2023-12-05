@@ -4,157 +4,152 @@
 #include <Wire.h>
 #include "config.h"
 
-#define CHECK_INTERVAL 100000
-#define DETECTOR_LENGTH 2
-#define IR_TRANSMITTER D8
-#define MOTOR_CURRENT_STATE_LENGTH 2
-#define OUTPUT_SIZE 64
-#define PRESCALER (F_CPU / 1000000UL)
-#define PULSE_FREQUENCY 38000
-#define PULSE_INTERVAL 5000
-#define PULSE_LENGTH 1000
-
-const uint8_t detectorPins[DETECTOR_LENGTH] = {D9, D10};
-
-EspMQTTClient client(
-    WIFI_SSID,
-    WIFI_PASSWORD,
-    AMQP_IP,
-    AMQP_USERNAME,
-    AMQP_PASSWORD,
-    DEVICE_NAME,
-    AMQP_PORT);
-
-hw_timer_t *Timer0_Cfg = NULL;
-unsigned long irDetected[] = {ULONG_MAX, ULONG_MAX};
-unsigned long irSent[] = {0, 0};
-unsigned long motorSent = 0;
-hw_timer_t *pulseTimer;
+EspMQTTClient client;
+unsigned long lastReadTime;
+std::vector<ReadDevice> readDevice;
+unsigned short readInterval;
+size_t outputTopicPrefixLength;
+String topicPrefix;
 SemaphoreHandle_t xMutex;
 
 void setup()
 {
-    size_t i;
-    Wire.begin();
+#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_ERROR
+    Serial.begin(115200);
+#endif
+    log_d("Initialising config document");
+    DynamicJsonDocument config(2048);
+    loadConfig(config);
 
-    for (i = 0; i < DETECTOR_LENGTH; i++)
+    String detectorTopic = config["detectorTopic"];
+    String ipAdress = config["server"]["ipAddress"];
+    String password = config["auth"]["password"];
+    String prefix = config["topicPrefix"];
+    readInterval = config["readInterval"];
+    String username = config["auth"]["username"];
+    String wifiPassword = config["wifi"]["password"];
+    String wifiSsid = config["wifi"]["ssid"];
+    short port = config["server"]["port"];
+
+    if (prefix.endsWith("/"))
     {
-        pinMode(detectorPins[i], INPUT);
-        attachInterrupt(digitalPinToInterrupt(detectorPins[i]), onIrDetect, FALLING);
+        topicPrefix = prefix;
+    }
+    else
+    {
+        topicPrefix = prefix + "/";
     }
 
-    xMutex = xSemaphoreCreateMutex();
+    JsonArray array = config["readDevices"];
+    readDevice = std::vector<ReadDevice>(array.size());
+    for (int i = 0; i < array.size(); i++)
+    {
+        readDevice[i].address = array[i]["address"];
+        readDevice[i].length = array[i]["length"];
+    }
 
-    pulseTimer = timerBegin(1, PRESCALER, true);
-    timerAttachInterrupt(pulseTimer, onStartPulse, true);
-    timerAlarmWrite(pulseTimer, PULSE_INTERVAL, true);
-    timerAlarmEnable(pulseTimer);
+#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_DEBUG
+    client.enableDebuggingMessages();
+#endif
+
+    log_d("Connecting to WIFI SSID: %s", config.wifiSsid.c_str());
+    client.setWifiCredentials(wifiSsid.c_str(), wifiPassword.c_str());
+
+    log_d("Client name: %s", config.mqttUsername.c_str());
+    client.setMqttClientName(username.c_str());
+
+    log_d("Connecting to the MQTT server: %s on port: %d", mqttServerIp.c_str(), port);
+    client.setMqttServer(ipAdress.c_str(), username.c_str(), password.c_str(), port);
+    log_i("Connected to the MQTT server");
+
     log_d("Setup complete");
 }
 
 void loop()
 {
-    StaticJsonDocument<OUTPUT_SIZE> doc;
-    String output;
-    size_t i;
+    int i, j;
+
     client.loop();
-    unsigned long start = micros() - CHECK_INTERVAL;
-
-    for (i = 0; i < DETECTOR_LENGTH; i++)
+    if ((lastReadTime - millis()) < 1000 * readInterval)
     {
-        // Send event if pin has been high since start of the interval
-        if (irDetected[i] < start && irSent[i] < start)
-        {
-            log_d("IR beam on input: %d was last detected at: %d and a message sent at: %d", i, irDetected[i], irSent[i]);
-            irSent[i] = micros();
-            output = String(i);
-            log_d("Sending new message");
-            client.publish(AMQP_DETECTOR_PUBLISH_TOPIC, output);
-        }
+        return;
     }
 
-    if (motorSent < start)
+    lastReadTime = millis();
+    while (!xSemaphoreTake(xMutex, portMAX_DELAY))
     {
-        doc.to<JsonArray>();
-        if (xSemaphoreTake(xMutex, portMAX_DELAY))
-        {
-            motorSent = micros();
-            log_d("Reading from %x", MOTOR_CONTROL_ADDRESS);
-            Wire.requestFrom(MOTOR_CONTROL_ADDRESS, MOTOR_CURRENT_STATE_LENGTH);
-            for (i = 0; i < MOTOR_CURRENT_STATE_LENGTH && Wire.available(); i++)
-            {
-                doc[i] = Wire.read();
-            }
-
-            for (i; i < MOTOR_CURRENT_STATE_LENGTH; i++)
-            {
-                doc[i] = 0;
-            }
-
-            while (Wire.read() != -1)
-            {
-            }
-
-            xSemaphoreGive(xMutex);
-
-            serializeJson(doc, output);
-            log_d("Writing '%s' to topic: %s", output.c_str(), AMQP_MOTOR_CONTROL_PUBLISH_TOPIC);
-            client.publish(AMQP_MOTOR_CONTROL_PUBLISH_TOPIC, output);
-        }
+        log_d("Waiting for lock on mutex");
     }
-}
 
-std::function<void(const String &message)> onReceiveFactory(uint8_t address)
-{
-    return [address](const String &payload)
+    for (i = 0; i < readDevice.size(); i++)
     {
-        StaticJsonDocument<64> doc;
-        size_t i;
-
-        deserializeJson(doc, payload);
-        JsonArray output = doc.as<JsonArray>();
-        if (output.size() == 0)
+        JsonArray bytes;
+        String output;
+        String topic = topicPrefix + "input/" + String(readDevice[i].address, HEX);
+        log_d("Reading from %x", readDevice[i].address);
+        Wire.requestFrom(readDevice[i].address, readDevice[i].length);
+        for (j = 0; j < readDevice[i].length && Wire.available(); j++)
         {
-            log_e("Invalid conetent in JSON");
-            return;
+            bytes[i] = Wire.read();
         }
 
-        while (!xSemaphoreTake(xMutex, portMAX_DELAY))
+        for (; j < readDevice[i].length; j++)
         {
-            log_d("Waiting for lock on mutex");
+            bytes[i] = 0;
         }
 
-        log_d("Writing %d bytes state to: %x", output.size(), address);
-        Wire.beginTransmission(address);
-        for (i = 0; i < output.size(); i++)
+        while (Wire.read() != -1)
         {
-            Wire.write((uint8_t)output[i]);
         }
 
-        Wire.endTransmission();
-        xSemaphoreGive(xMutex);
-    };
+        serializeJson(bytes, output);
+        log_d("Writing '%s' to topic: %s", output.c_str(), topic);
+        client.publish(topic, output);
+    }
+    xSemaphoreGive(xMutex);
 }
 
 void onConnectionEstablished()
 {
-    client.subscribe(AMQP_MOTOR_CONTROL_SUBSCRIBE_TOPIC, onReceiveFactory(MOTOR_CONTROL_ADDRESS));
-    client.subscribe(AMQP_POINTS_CONTROL_SUBSCRIBE_TOPIC, onReceiveFactory(POINTS_CONTROL_ADDRESS));
+    String topicPattern;
+    topicPattern += "output/#";
+    outputTopicPrefixLength = topicPattern.length() - 1;
+    log_d("Adding subscription to topic: %s", topicPattern.c_str());
+    client.subscribe(topicPrefix, onReceive, 0);
 }
 
-void onIrDetect()
+void onReceive(const String &topicStr, const String &message)
 {
-    size_t i;
-    for (i = 0; i < DETECTOR_LENGTH; i++)
+    String addressStr = topicStr.substring(outputTopicPrefixLength);
+    unsigned char address = strtoul(addressStr.c_str(), 0, 16);
+    if (address == 0)
     {
-        if (!digitalRead(detectorPins[i]))
-        {
-            irDetected[i] = micros();
-        }
+        log_e("Invalid addrss in topic: %s", topicStr.c_str());
     }
-}
 
-void onStartPulse()
-{
-    tone(IR_TRANSMITTER, PULSE_FREQUENCY, PULSE_LENGTH);
+    StaticJsonDocument<64> doc;
+    size_t i;
+
+    deserializeJson(doc, message);
+    JsonArray output = doc.as<JsonArray>();
+    if (output.size() == 0)
+    {
+        log_e("Invalid conetent in JSON");
+        return;
+    }
+
+    while (!xSemaphoreTake(xMutex, portMAX_DELAY))
+    {
+        log_d("Waiting for lock on mutex");
+    }
+
+    log_d("Writing %d bytes state to: %x", output.size(), address);
+    Wire.beginTransmission(address);
+    for (i = 0; i < output.size(); i++)
+    {
+        Wire.write((uint8_t)output[i]);
+    }
+
+    Wire.endTransmission();
+    xSemaphoreGive(xMutex);
 }
