@@ -5,7 +5,7 @@
 #include "config.h"
 
 EspMQTTClient client;
-unsigned long lastReadTime;
+unsigned long lastReadTime = 0;
 std::vector<ReadDevice> readDevice;
 unsigned short readInterval;
 size_t outputTopicPrefixLength;
@@ -40,6 +40,8 @@ void setup()
         topicPrefix = prefix + "/";
     }
 
+    log_d("Topic prefix: %d", topicPrefix.c_str());
+
     JsonArray array = config["readDevices"];
     readDevice = std::vector<ReadDevice>(array.size());
     for (int i = 0; i < array.size(); i++)
@@ -52,16 +54,18 @@ void setup()
     client.enableDebuggingMessages();
 #endif
 
-    log_d("Connecting to WIFI SSID: %s", config.wifiSsid.c_str());
+    log_d("Connecting to WIFI SSID: %s", wifiSsid.c_str());
     client.setWifiCredentials(wifiSsid.c_str(), wifiPassword.c_str());
 
-    log_d("Client name: %s", config.mqttUsername.c_str());
+    log_d("Client name: %s", username.c_str());
     client.setMqttClientName(username.c_str());
 
-    log_d("Connecting to the MQTT server: %s on port: %d", mqttServerIp.c_str(), port);
+    log_d("Connecting to the MQTT server: %s on port: %d", ipAdress.c_str(), port);
     client.setMqttServer(ipAdress.c_str(), username.c_str(), password.c_str(), port);
     log_i("Connected to the MQTT server");
 
+    Wire.begin();
+    xMutex = xSemaphoreCreateMutex();
     log_d("Setup complete");
 }
 
@@ -70,7 +74,7 @@ void loop()
     int i, j;
 
     client.loop();
-    if ((lastReadTime - millis()) < 1000 * readInterval)
+    if ((millis() - lastReadTime) < 1000 * readInterval)
     {
         return;
     }
@@ -103,7 +107,7 @@ void loop()
         }
 
         serializeJson(bytes, output);
-        log_d("Writing '%s' to topic: %s", output.c_str(), topic);
+        log_d("Writing '%s' to topic: %s", output.c_str(), topic.c_str());
         client.publish(topic, output);
     }
     xSemaphoreGive(xMutex);
