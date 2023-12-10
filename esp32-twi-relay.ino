@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include <ArduinoJson.h>
 #include <EspMQTTClient.h>
 #include <Wire.h>
 #include "config.h"
@@ -9,7 +8,13 @@ unsigned long lastReadTime = 0;
 std::vector<ReadDevice> readDevice;
 unsigned short readInterval;
 size_t outputTopicPrefixLength;
-String topicPrefix;
+String *ipAdress;
+String *password;
+String *prefix;
+String *topicPrefix;
+String *username;
+String *wifiPassword;
+String *wifiSsid;
 SemaphoreHandle_t xMutex;
 
 void setup()
@@ -21,26 +26,25 @@ void setup()
     DynamicJsonDocument config(2048);
     loadConfig(config);
 
-    String detectorTopic = config["detectorTopic"];
-    String ipAdress = config["server"]["ipAddress"];
-    String password = config["auth"]["password"];
+    ipAdress = new String((const char *)config["server"]["ipAddress"]);
+    password = new String((const char *)config["auth"]["password"]);
     String prefix = config["topicPrefix"];
     readInterval = config["readInterval"];
-    String username = config["auth"]["username"];
-    String wifiPassword = config["wifi"]["password"];
-    String wifiSsid = config["wifi"]["ssid"];
+    username = new String((const char *)config["auth"]["username"]);
+    wifiPassword = new String((const char *)config["wifi"]["password"]);
+    wifiSsid = new String((const char *)config["wifi"]["ssid"]);
     short port = config["server"]["port"];
 
     if (prefix.endsWith("/"))
     {
-        topicPrefix = prefix;
+        topicPrefix = new String(prefix);
     }
     else
     {
-        topicPrefix = prefix + "/";
+        topicPrefix = new String(prefix + "/");
     }
 
-    log_d("Topic prefix: %d", topicPrefix.c_str());
+    log_d("Topic prefix: %s", topicPrefix->c_str());
 
     JsonArray array = config["readDevices"];
     readDevice = std::vector<ReadDevice>(array.size());
@@ -54,14 +58,14 @@ void setup()
     client.enableDebuggingMessages();
 #endif
 
-    log_d("Connecting to WIFI SSID: %s", wifiSsid.c_str());
-    client.setWifiCredentials(wifiSsid.c_str(), wifiPassword.c_str());
+    log_d("Connecting to WIFI SSID: %s", wifiSsid->c_str());
+    client.setWifiCredentials(wifiSsid->c_str(), wifiPassword->c_str());
 
-    log_d("Client name: %s", username.c_str());
-    client.setMqttClientName(username.c_str());
+    log_d("Client name: %s", username->c_str());
+    client.setMqttClientName(username->c_str());
 
-    log_d("Connecting to the MQTT server: %s on port: %d", ipAdress.c_str(), port);
-    client.setMqttServer(ipAdress.c_str(), username.c_str(), password.c_str(), port);
+    log_d("Connecting to the MQTT server: %s on port: %d", ipAdress->c_str(), port);
+    client.setMqttServer(ipAdress->c_str(), username->c_str(), password->c_str(), port);
     log_i("Connected to the MQTT server");
 
     Wire.begin();
@@ -74,6 +78,11 @@ void loop()
     int i, j;
 
     client.loop();
+    if (!client.isConnected())
+    {
+        return;
+    }
+
     if ((millis() - lastReadTime) < 1000 * readInterval)
     {
         return;
@@ -87,26 +96,28 @@ void loop()
 
     for (i = 0; i < readDevice.size(); i++)
     {
-        JsonArray bytes;
+        DynamicJsonDocument doc(1024);
         String output;
-        String topic = topicPrefix + "input/" + String(readDevice[i].address, HEX);
+        String topic = *topicPrefix + "input/" + String(readDevice[i].address, HEX);
         log_d("Reading from %x", readDevice[i].address);
         Wire.requestFrom(readDevice[i].address, readDevice[i].length);
         for (j = 0; j < readDevice[i].length && Wire.available(); j++)
         {
-            bytes[i] = Wire.read();
+            doc[j] = Wire.read();
         }
+
+        log_d("Read %d out of %d bytes", j, readDevice[i].length);
 
         for (; j < readDevice[i].length; j++)
         {
-            bytes[i] = 0;
+            doc[j] = 0;
         }
 
         while (Wire.read() != -1)
         {
         }
 
-        serializeJson(bytes, output);
+        serializeJson(doc, output);
         log_d("Writing '%s' to topic: %s", output.c_str(), topic.c_str());
         client.publish(topic, output);
     }
@@ -115,11 +126,10 @@ void loop()
 
 void onConnectionEstablished()
 {
-    String topicPattern;
-    topicPattern += "output/#";
+    String topicPattern = *topicPrefix + "output/#";
     outputTopicPrefixLength = topicPattern.length() - 1;
     log_d("Adding subscription to topic: %s", topicPattern.c_str());
-    client.subscribe(topicPrefix, onReceive, 0);
+    client.subscribe(topicPattern, onReceive, 0);
 }
 
 void onReceive(const String &topicStr, const String &message)
@@ -128,7 +138,7 @@ void onReceive(const String &topicStr, const String &message)
     unsigned char address = strtoul(addressStr.c_str(), 0, 16);
     if (address == 0)
     {
-        log_e("Invalid addrss in topic: %s", topicStr.c_str());
+        log_e("Invalid address in topic: %s", topicStr.c_str());
     }
 
     StaticJsonDocument<64> doc;
@@ -138,7 +148,7 @@ void onReceive(const String &topicStr, const String &message)
     JsonArray output = doc.as<JsonArray>();
     if (output.size() == 0)
     {
-        log_e("Invalid conetent in JSON");
+        log_e("Invalid content in JSON");
         return;
     }
 
